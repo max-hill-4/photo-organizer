@@ -103,13 +103,13 @@ Errors are logged line-by-line to `errors.log` in the working directory.
 
 ## Benchmarks
 
-Tested on 357 files (4.1 GB) from an Apple Photos library on a USB drive (WSL2, Windows 11).
+Tested on ~430 files (4.1 GB) from an Apple Photos library on a USB drive (WSL2, Windows 11).
 
-| Tool | Task | Time | Notes |
-|---|---|---|---|
-| **photo-organizer** | EXIF parse + copy 4.1 GB | **4m 9s** | 4 workers, 16.7 MB/s sustained |
-| exiftool | EXIF parse only (no copy) | 1m 15s | Single-threaded Perl |
+| Tool | Files copied | Data | Time | Avg speed |
+|---|---|---|---|---|
+| **photo-organizer** | 357 | 4.1 GB | **4m 09s** | 16.7 MB/s |
+| exiftool | 427 | 3.5 GB | 16m 38s | 3.5 MB/s |
 
-photo-organizer does EXIF parsing **and** copies all data in ~3.3x the time exiftool takes just to read the same files. The bottleneck is USB drive throughput, not the tool itself — on an SSD the gap widens further in photo-organizer's favour.
+**4x faster than exiftool.** photo-organizer also skips macOS `._` resource fork files that exiftool copies as junk, and organises everything into `YYYY/MM/DD` folders in one pass.
 
-On a dry run (no I/O), photo-organizer processes 357 files in under 1 second.
+On a dry run (no I/O), photo-organizer processes the same files in under 1 second.
