@@ -1,0 +1,102 @@
+# photo-organizer
+
+Copies photos and videos from messy folder structures (e.g. Apple Photos library backups) into a clean `YYYY/MM/DD/filename.ext` layout. Safe to re-run — already-copied files are skipped automatically.
+
+## Install
+
+Requires [Go 1.22+](https://go.dev/dl/).
+
+```bash
+git clone https://github.com/max-hill-4/photo-organizer
+cd photo-organizer
+go build -ldflags="-s -w" -o photo-organizer .
+```
+
+## Usage
+
+```
+./photo-organizer [flags] <source-dir> <dest-dir>
+```
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dry-run` | false | Print what would happen, no files copied |
+| `--workers` | 4 | Parallel copy workers |
+| `--buf-size` | 8192 | I/O buffer size in KB |
+| `--log-file` | — | Write full JSON log to file |
+| `--unknown-dir` | `<dest>/unknown` | Folder for files with no determinable date |
+| `--verbose` | false | Log every file action |
+| `--date-test` | — | Test date extraction on a single file and exit |
+
+## Examples
+
+**Dry run first (always recommended):**
+```bash
+./photo-organizer --dry-run --verbose /mnt/d/Pictures /mnt/c/Users/you/Pictures/Backup
+```
+
+**Full run:**
+```bash
+./photo-organizer --workers 4 --log-file run.json /mnt/d/Pictures /mnt/c/Users/you/Pictures/Backup
+```
+
+**Check what date a single file would get:**
+```bash
+./photo-organizer --date-test /mnt/d/Pictures/IMG_1234.JPG
+# File:   /mnt/d/Pictures/IMG_1234.JPG
+# Date:   2021-06-14
+# Source: EXIF
+```
+
+**Tune workers for faster SSDs:**
+```bash
+./photo-organizer --workers 8 /source /dest
+```
+
+## How it works
+
+### Date extraction (in priority order)
+
+1. **EXIF** — reads `DateTimeOriginal` from JPEG, TIFF, RAW files
+2. **HEIC** — parses EXIF from Apple HEIC files (pure Go, no C deps)
+3. **Video mvhd** — reads creation time from MOV/MP4 container atom
+4. **Filename** — matches patterns like `20210614_183000`, `2021-06-14`, `20210614`
+5. **mtime** — falls back to file's last modified timestamp
+
+Files where no reliable date can be found go into `<dest>/unknown/`.
+
+### Duplicate handling
+
+- Dest file exists, **same size** → skip (already copied)
+- Dest file exists, **different size** → save as `filename_1.ext`, `filename_2.ext`, etc.
+
+### Supported formats
+
+`jpg jpeg png heic tiff tif cr2 nef arw dng mov mp4 m4v 3gp gif bmp webp aae`
+
+macOS `._` resource fork files are automatically skipped.
+
+## Output
+
+```
+=== Photo Organizer Summary ===
+Files scanned:    13,097
+  Copied:         12,077  (61.2 GB)
+  Skipped (dup):  1,020
+  Renamed:        3
+  Errors:         0
+  Unknown date:   0  (→ unknown/)
+
+Date sources:
+  EXIF:           12,049 ( 92%)
+  HEIC:              421 (  3%)
+  Video mvhd:         28 (  0%)
+  Filename:            0 (  0%)
+  mtime:             599 (  5%)
+
+Elapsed: 47m 2s   Avg: 22.3 MB/s
+```
+
+Errors are logged line-by-line to `errors.log` in the working directory.
