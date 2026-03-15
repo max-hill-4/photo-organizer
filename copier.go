@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"fmt"
 	"io"
 	"os"
@@ -16,13 +17,16 @@ type CopyResult struct {
 	Dst        string
 	DateSource DateSource
 	Date       time.Time
-	Action     string // "copied", "skipped", "renamed", "error"
+	Action     string // "copied", "skipped", "renamed", "error", "unknown_date"
 	Bytes      int64
 	Err        error
 }
 
 // dirCache avoids redundant MkdirAll syscalls.
 var dirCache sync.Map
+
+// hashRegistry stores MD5 hashes of all copied source files for global dedup.
+var hashRegistry sync.Map
 
 // bufPool holds reusable I/O buffers.
 var bufPool = sync.Pool{
@@ -74,6 +78,16 @@ func Process(cfg *Config, job Job) CopyResult {
 		}
 	}
 
+	// Hash-based global dedup: skip if we've already copied this exact file
+	if cfg.hashDedup {
+		h, err := hashFile(job.Path)
+		if err == nil {
+			if _, seen := hashRegistry.LoadOrStore(h, job.Path); seen {
+				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped", Bytes: 0}
+			}
+		}
+	}
+
 	action, finalDest, n, err := copyFile(cfg, job.Path, destPath, job.Info.Size())
 	// Preserve original timestamps on newly copied files
 	if err == nil && (action == "copied" || action == "renamed") {
@@ -89,7 +103,7 @@ func Process(cfg *Config, job Job) CopyResult {
 
 // copyFile copies src to dest handling dedup. Returns action, final dest path, bytes written, error.
 func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int64, error) {
-	finalDest, skip, err := pickDest(dest, srcSize)
+	finalDest, skip, err := pickDest(dest, srcSize, cfg.hashDedup)
 	if err != nil {
 		return "error", dest, 0, err
 	}
@@ -104,7 +118,6 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 
 	f, err := os.OpenFile(finalDest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
-		// Another worker may have claimed it between pickDest and here; treat as error
 		return "error", finalDest, 0, err
 	}
 	defer f.Close()
@@ -131,37 +144,75 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 	return action, finalDest, n, nil
 }
 
-// pickDest resolves the final destination path for a file:
-// - If dest does not exist: return (dest, false, nil) — proceed with copy
-// - If dest exists and sizes match: return (dest, true, nil) — skip (duplicate)
-// - If dest exists and sizes differ: try _1.._99 suffixes, return first available
-func pickDest(dest string, srcSize int64) (string, bool, error) {
-	info, err := os.Stat(dest)
-	if os.IsNotExist(err) {
-		return dest, false, nil
+// pickDest resolves the final destination path:
+// - dest not exist → (dest, false)
+// - dest exists, same size → (dest, true) skip
+// - dest exists, same hash (if hashDedup) → (dest, true) skip
+// - dest exists, different content → try _1.._99
+func pickDest(dest string, srcSize int64, hashDedup bool) (string, bool, error) {
+	check := func(path string) (exists bool, skip bool, err error) {
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			return false, false, nil
+		}
+		if err != nil {
+			return false, false, err
+		}
+		if info.Size() == srcSize {
+			return true, true, nil // same size → skip
+		}
+		if hashDedup {
+			// sizes differ but content might still match
+			sh, err := hashFile(path)
+			if err == nil {
+				if _, seen := hashRegistry.Load(sh); seen {
+					return true, true, nil
+				}
+			}
+		}
+		return true, false, nil // exists but different → need rename
 	}
+
+	exists, skip, err := check(dest)
 	if err != nil {
 		return dest, false, err
 	}
-	if info.Size() == srcSize {
-		return dest, true, nil // same size → duplicate, skip
+	if !exists {
+		return dest, false, nil
+	}
+	if skip {
+		return dest, true, nil
 	}
 
-	// Size mismatch: try suffixed names
 	ext := filepath.Ext(dest)
 	base := strings.TrimSuffix(dest, ext)
 	for i := 1; i <= 99; i++ {
 		candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
-		info2, err2 := os.Stat(candidate)
-		if os.IsNotExist(err2) {
+		exists, skip, err := check(candidate)
+		if err != nil {
+			return dest, false, err
+		}
+		if !exists {
 			return candidate, false, nil
 		}
-		if err2 != nil {
-			return dest, false, err2
-		}
-		if info2.Size() == srcSize {
-			return candidate, true, nil // existing suffixed file with same size → skip
+		if skip {
+			return candidate, true, nil
 		}
 	}
 	return dest, false, fmt.Errorf("too many name collisions for %s", dest)
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := md5.New()
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	if _, err := io.CopyBuffer(h, f, *bufPtr); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }

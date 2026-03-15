@@ -26,6 +26,7 @@ type Config struct {
 	logFile    string
 	unknownDir string
 	verbose    bool
+	hashDedup  bool
 }
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 		logFile    = flag.String("log-file", "", "Write JSON summary to file")
 		unknownDir = flag.String("unknown-dir", "", "Dir for undatable files (default: <dest>/unknown)")
 		verbose    = flag.Bool("verbose", false, "Log each file action")
+		hashDedup  = flag.Bool("hash-dedup", false, "Use MD5 hash to detect duplicates across different filenames/sizes")
 		dateTest   = flag.String("date-test", "", "Test date extraction on a single file and exit")
 	)
 	flag.Parse()
@@ -68,6 +70,7 @@ func main() {
 		logFile:    *logFile,
 		unknownDir: *unknownDir,
 		verbose:    *verbose,
+		hashDedup:  *hashDedup,
 	}
 	if cfg.unknownDir == "" {
 		cfg.unknownDir = cfg.destDir + "/unknown"
