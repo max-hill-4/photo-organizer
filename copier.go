@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,11 @@ var dirCache sync.Map
 
 // hashRegistry stores MD5 hashes of all copied source files for global dedup.
 var hashRegistry sync.Map
+
+// tsRegistry stores "destDir|timestamp" keys to detect same-second duplicates.
+var tsRegistry sync.Map
+
+var uuidRE = regexp.MustCompile(`(?i)^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\.[a-zA-Z0-9]+$`)
 
 // bufPool holds reusable I/O buffers.
 var bufPool = sync.Pool{
@@ -62,6 +68,21 @@ func Process(cfg *Config, job Job) CopyResult {
 	}
 
 	destPath := filepath.Join(destDir, filepath.Base(job.Path))
+
+	// Same-second dedup: if another file with the same EXIF timestamp has already
+	// claimed this dest folder, skip the current file if it is smaller.
+	if dateSrc == DateSourceEXIF {
+		tsKey := destDir + "|" + dateT.Format("2006:01:02 15:04:05")
+		type entry struct{ size int64 }
+		cur := entry{job.Info.Size()}
+		if prev, loaded := tsRegistry.LoadOrStore(tsKey, cur); loaded {
+			if cur.size <= prev.(entry).size {
+				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
+			}
+			// Current is larger — update registry and proceed to copy
+			tsRegistry.Store(tsKey, cur)
+		}
+	}
 
 	if cfg.dryRun {
 		action := "copied"
