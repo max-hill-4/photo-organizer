@@ -1,6 +1,10 @@
 # photo-organizer
 
-Copies photos and videos from messy folder structures (e.g. Apple Photos library backups) into a clean `YYYY/MM/DD/filename.ext` layout. Safe to re-run — already-copied files are skipped automatically.
+Apple Photos and iPhoto libraries from macOS 10.15 and earlier are no longer supported by modern versions of macOS or Windows. If you have old `.photoslibrary` or `.migratedphotolibrary` backups sitting on an external drive, you can't just open them — the app that created them is gone.
+
+This tool extracts all your photos and videos out of those libraries and organises them into a simple `YYYY/MM/DD/filename.ext` folder structure you can browse in any file explorer, import into Google Photos, or archive however you like.
+
+It also handles a common problem with old Apple libraries: the same photo often exists in multiple places with different names (e.g. `IMG_0178.jpg` and a UUID-named copy like `8A198053-....jpeg`). The `dedup` tool finds these same-second duplicates and removes the smaller copy, so you don't end up with hundreds of gigabytes of duplicates.
 
 ## Install
 
@@ -100,6 +104,29 @@ Elapsed: 47m 2s   Avg: 22.3 MB/s
 ```
 
 Errors are logged line-by-line to `errors.log` in the working directory.
+
+## Deduplication
+
+Old Apple libraries frequently contain the same photo multiple times — once with its original camera name (`IMG_XXXX.jpg`) and again with a UUID name (`8A198053-441B-4B16-9DA0-3639CCE75AEC.jpeg`). These are created when Photos or iPhoto imports photos and re-encodes them internally.
+
+The `dedup` tool detects these by comparing EXIF `DateTimeOriginal` timestamps. Two files in the same date folder taken at the exact same second are almost certainly the same photo. It keeps the largest version (highest quality) and deletes the smaller one.
+
+**Build:**
+```bash
+go build -ldflags="-s -w" -o dedup ./cmd/dedup/
+```
+
+**Dry run first:**
+```bash
+./dedup --dry-run /mnt/c/Users/yourname/Pictures/Backup
+```
+
+**Delete duplicates:**
+```bash
+./dedup /mnt/c/Users/yourname/Pictures/Backup
+```
+
+The `photo-organizer` tool also applies this same-second dedup logic during copying, so if you run it fresh it won't create duplicates in the first place.
 
 ## Benchmarks
 
