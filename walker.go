@@ -82,6 +82,8 @@ func Walk(sourceDir string, jobs chan<- Job, stats *Stats) error {
 				continue
 			}
 
+			stats.Discovered.Add(1)
+
 			// Pre-filter: if this file is already in the destination, count it
 			// as skipped here without going through the worker pipeline at all.
 			if _, skip := destIndex[name+"|"+strconv.FormatInt(info.Size(), 10)]; skip {

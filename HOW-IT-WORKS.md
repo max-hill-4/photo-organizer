@@ -12,26 +12,29 @@ files with minimal overhead on re-runs.
 
 ## Stage 1 — Pre-scan
 
-Before any copying begins, the tool runs a pre-scan of both the source and
-destination directories in parallel.
+Before any copying begins, the tool pre-scans the destination directory to
+build two in-memory structures used throughout the copy phase.
 
 **Destination walk**
 
-Every file already in the destination is registered in two in-memory
-structures:
+Every file already in the destination is registered in:
 
 - **`destIndex`** — a fast lookup table keyed by `filename|size`. If the
   exact same filename and size is already in the destination, the file can be
   skipped instantly without reading any metadata. This is the primary
   short-circuit for re-runs where most files are already present.
 
-- **`tsRegistry`** — a table keyed by `folder|timestamp`. For each file that
-  has a reliable date (EXIF, HEIC, or video mvhd), the file is registered
-  under its timestamp so that duplicate files with the same creation time
-  can be caught during the copy phase. Each file is registered under up to
-  two keys — its primary extracted date **and** its filesystem mtime — to
-  handle the case where a duplicate has lost its original metadata but
-  preserved the timestamp as mtime.
+- **`tsRegistry`** — a table keyed by `folder|timestamp`. Each file is
+  registered under its **oldest credible timestamp**: whichever of the
+  extracted date or the filesystem mtime is earlier (mtime is ignored if it
+  falls outside 1990–2100). This single key catches same-photo duplicates
+  regardless of whether they have intact metadata or not — a copy with
+  corrupted EXIF showing 2026 but a mtime of 2009 will resolve to 2009 and
+  match correctly against the original.
+
+The walk collects each file's size and mtime directly from the directory
+entry (`DirEntry.Info()`). This metadata is passed straight through to the
+EXIF workers — no second `stat` call per file is needed.
 
 **Pre-scan cache**
 
@@ -51,12 +54,8 @@ source}`. On pre-scan, the worker checks the cache first:
 The cache is rewritten after every pre-scan, containing only files currently
 present in the destination — so deleted files are pruned automatically. On a
 stable destination re-run, pre-scan cost drops from N full file reads to N
-`stat` calls plus one gob decode.
-
-**Source walk**
-
-The source directory is counted so the progress bar has a known total to work
-with.
+stat checks (via the already-collected `DirEntry.Info()`) plus one gob
+decode.
 
 ---
 
@@ -74,12 +73,18 @@ else:
 1. Skip symlinks, devices, and macOS `._` resource fork files
 2. Skip unsupported file extensions
 3. Skip zero-byte files
-4. **Check `destIndex`** — if `filename|size` is already in the destination,
+4. **Increment `Discovered`** — the file counts toward the progress bar total.
+5. **Check `destIndex`** — if `filename|size` is already in the destination,
    count the file as skipped immediately without sending it to any worker.
    This avoids all channel and goroutine overhead for already-present files,
    which on a re-run is typically 80%+ of all files.
 
 Files that pass all filters are sent to the worker pool as jobs.
+
+The `Discovered` counter grows as the walker runs concurrently with the copy
+workers. The progress bar uses it as its total, transitioning from a spinner
+(total unknown) to a deterministic fill as files are found. The source
+directory is never walked twice — there is no separate pre-count pass.
 
 ---
 
@@ -117,15 +122,16 @@ If no valid date can be found, the file goes to:
 ### Duplicate detection (same-folder)
 
 Before copying, the worker checks `tsRegistry` for any file already present in
-the same destination folder with the same timestamp. Each incoming file is
-checked against up to two keys — its primary date and its mtime:
+the same destination folder with the same timestamp. Each file is registered
+and checked under a single key: the **oldest** of its extracted date and its
+mtime (provided mtime is within 1990–2100):
 
 ```
-File A (original):   EXIF = 05:58:50,  mtime = 06:13:05
-  → registered under keys: ["2011/02/08|05:58:50", "2011/02/08|06:13:05"]
+File A (original):   EXIF = 2011-02-08 05:58:50,  mtime = 2011-02-08 06:13:05
+  → key: "2011/02/08|05:58:50"  (EXIF is older)
 
-File B (degraded duplicate, lost EXIF):  mtime = 05:58:50
-  → checks key "2011/02/08|05:58:50" → finds File A → duplicate!
+File B (corrupt EXIF = 2026, mtime = 2011-02-08 05:58:50):
+  → key: "2011/02/08|05:58:50"  (mtime is older) → matches File A → duplicate!
 ```
 
 The rule is always **keep the largest file** (highest quality). If the
@@ -185,8 +191,11 @@ For cleaning up duplicates already present in a destination directory, the
 
 For each folder in the destination:
 
-1. Every file's timestamps (primary date + mtime) are extracted using the same
-   date extraction logic as the copy phase
+1. Every file's timestamps (primary date + mtime) are extracted. The prescan
+   cache (`<dest>/.photo-organizer.cache`) is consulted first: if a file's
+   size and mtime match the cached entry, the stored date is used directly
+   without opening the file. Only new or changed files are parsed with
+   `ExtractDate`.
 2. Files that share any timestamp key are grouped together using a
    [union-find](https://en.wikipedia.org/wiki/Disjoint-set_data_structure)
    algorithm — so if File A and File B share one timestamp, and File B and
@@ -222,8 +231,12 @@ Always run with `--dry-run` first to preview what would be deleted:
 - Re-runs where most files are already in the destination are much faster —
   the `destIndex` pre-filter means skipped files cost two atomic counter
   increments, no file I/O at all
-- Pre-scan on a stable destination is equally fast: the cache (`<dest>/.photo-organizer.cache`)
-  reduces EXIF extraction to a `stat` call per file; only new or changed
-  destination files are opened and parsed
+- Pre-scan on a stable destination is equally fast: size and mtime are
+  collected once from `DirEntry.Info()` during the walk; the cache
+  (`<dest>/.photo-organizer.cache`) then eliminates any file opens for
+  unchanged files; only new or changed destination files are parsed
+- The source directory is walked exactly once — during the copy phase itself.
+  The `Discovered` counter on `Stats` accumulates as the walker runs, so
+  the progress bar needs no separate pre-count pass
 - The HEIC and video date readers are limited to 512 KB per file; EXIF data
   is always within the first few hundred bytes so this is more than sufficient

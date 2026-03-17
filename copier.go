@@ -52,7 +52,7 @@ func Process(cfg *Config, job Job) CopyResult {
 	// Same-folder dedup: group files by shared timestamp keys, keep largest.
 	// buildTsKeys indexes under both the primary date and mtime so a degraded
 	// duplicate (one that lost its EXIF but preserved mtime) is still caught.
-	tsKeys := buildTsKeys(destDir, dateT, dateSrc, job.Info.ModTime())
+	tsKeys := buildTsKeys(destDir, dateT, job.Info.ModTime())
 	var prevDestToDelete string
 	var bestPrev *tsEntry
 	for _, k := range tsKeys {
@@ -128,22 +128,20 @@ func Process(cfg *Config, job Job) CopyResult {
 	return result
 }
 
-// buildTsKeys returns the timestamp keys to register/check in tsRegistry for
-// a file. We always include the primary extracted date. For files with a
-// reliable source (EXIF/HEIC/Video) we also index by mtime when it differs —
-// a degraded duplicate that has lost its original metadata may only have mtime
-// left, and that mtime often matches the original's creation timestamp.
-func buildTsKeys(destDir string, dateT time.Time, dateSrc DateSource, mtime time.Time) []string {
-	dt := dateT.UTC().Truncate(time.Second)
-	primary := destDir + "|" + dt.Format("2006:01:02 15:04:05")
-
-	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC || dateSrc == DateSourceVideo {
-		mt := mtime.UTC().Truncate(time.Second)
-		if !mt.Equal(dt) {
-			return []string{primary, destDir + "|" + mt.Format("2006:01:02 15:04:05")}
-		}
+// buildTsKeys returns the timestamp key used to register/check a file in
+// tsRegistry. The key is the oldest credible timestamp: whichever of the
+// extracted date or mtime is earlier (mtime only considered when it falls
+// within 1990–2100, to ignore epoch-zero or obviously wrong values).
+// A single key is always returned; duplicates sharing that timestamp in the
+// same destination folder are grouped regardless of which metadata field
+// holds the date on each copy.
+func buildTsKeys(destDir string, dateT time.Time, mtime time.Time) []string {
+	t := dateT.UTC().Truncate(time.Second)
+	mt := mtime.UTC().Truncate(time.Second)
+	if y := mt.Year(); y >= 1990 && y <= 2100 && mt.Before(t) {
+		t = mt
 	}
-	return []string{primary}
+	return []string{destDir + "|" + t.Format("2006:01:02 15:04:05")}
 }
 
 // copyFile copies src to dest. Returns action, final dest path, bytes written, error.

@@ -126,8 +126,7 @@ func run(ctx context.Context, cfg *Config) error {
 	defer errWriter.Flush()
 
 	// Pre-populate tsRegistry from dest so smaller duplicates are skipped.
-	// Also counts source files so the copy bar has a known total.
-	sourceTotal := prescanDest(cfg.destDir, cfg.sourceDir, cfg.workers)
+	prescanDest(cfg.destDir, cfg.workers)
 
 	stats := &Stats{}
 	var jsonRecords []map[string]any
@@ -170,19 +169,24 @@ func run(ctx context.Context, cfg *Config) error {
 		for tick := 0; ; tick++ {
 			time.Sleep(500 * time.Millisecond)
 			scanned := int(stats.Scanned.Load())
+			discovered := int(stats.Discovered.Load())
 			skipped := int(stats.Skipped.Load())
 			elapsed := time.Since(start)
 			skipPct := 0.0
 			if scanned > 0 {
 				skipPct = float64(skipped) / float64(scanned) * 100
 			}
+			pct := 0.0
+			if discovered > 0 {
+				pct = float64(scanned) / float64(discovered) * 100
+			}
 			fmt.Fprintf(os.Stderr, "\rCopying  %s  %s / %s  %.1f%%  skipped %.0f%%  elapsed %s%s   ",
-				drawBar(scanned, sourceTotal, tick),
-				commaf(int64(scanned)), commaf(int64(sourceTotal)),
-				float64(scanned)/float64(sourceTotal)*100,
+				drawBar(scanned, discovered, tick),
+				commaf(int64(scanned)), commaf(int64(discovered)),
+				pct,
 				skipPct,
 				elapsed.Round(time.Second),
-				etaStr(scanned, sourceTotal, elapsed),
+				etaStr(scanned, discovered, elapsed),
 			)
 		}
 	}()

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/gob"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,52 +48,22 @@ func savePrescanCache(destDir string, entries map[string]prescanCacheEntry) {
 	_ = gob.NewEncoder(f).Encode(entries)
 }
 
+// destScanEntry holds the filesystem metadata collected for a dest file during
+// the initial directory walk. Workers receive it directly so no re-stat is needed.
+type destScanEntry struct {
+	path  string
+	size  int64
+	mtime time.Time
+}
+
 // prescanDest walks destDir and pre-populates tsRegistry with files already
 // present, so the copy run skips source files that are smaller than an
 // already-present file with the same EXIF/HEIC timestamp. The largest file
-// per timestamp wins. It also counts source files and returns that total so
-// the copy progress bar can show a determinate fill.
-func prescanDest(destDir, sourceDir string, workers int) int {
-	// Initialise destIndex as a plain map — written only here (single goroutine),
-	// then read-only for the entire copy phase.
-	destIndex = make(map[string]struct{})
+// per timestamp wins.
+func prescanDest(destDir string, workers int) {
+	var destCount atomic.Int64
 
-	var destFiles, srcFiles []string
-	var destCount, srcCount atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		filepath.WalkDir(destDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
-			}
-			if supportedExts[strings.ToLower(filepath.Ext(path))] {
-				if info, err := os.Stat(path); err == nil {
-					key := filepath.Base(path) + "|" + strconv.FormatInt(info.Size(), 10)
-					destIndex[key] = struct{}{}
-				}
-				destFiles = append(destFiles, path)
-				destCount.Add(1)
-			}
-			return nil
-		})
-	}()
-	go func() {
-		defer wg.Done()
-		filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
-			}
-			if supportedExts[strings.ToLower(filepath.Ext(path))] {
-				srcFiles = append(srcFiles, path)
-				srcCount.Add(1)
-			}
-			return nil
-		})
-	}()
-
-	// Show live counts while walking.
+	// Show live count while walking.
 	walkDone := make(chan struct{})
 	go func() {
 		for tick := 0; ; tick++ {
@@ -104,63 +73,120 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 			default:
 			}
 			time.Sleep(500 * time.Millisecond)
-			fmt.Fprintf(os.Stderr, "\rWalking  %s  dest %s  source %s   ",
-				drawBar(0, 0, tick), commaf(destCount.Load()), commaf(srcCount.Load()))
+			fmt.Fprintf(os.Stderr, "\rWalking  %s  dest %s   ",
+				drawBar(0, 0, tick), commaf(destCount.Load()))
 		}
 	}()
+
+	// Concurrent walk — same pattern as Walk() in walker.go.
+	// Entries are collected under a mutex; most time is spent in os.ReadDir
+	// (I/O bound) so contention is negligible.
+	var mu sync.Mutex
+	var destFiles []destScanEntry
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 64)
+
+	var walk func(dir string)
+	walk = func(dir string) {
+		defer wg.Done()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, d := range entries {
+			name := d.Name()
+			path := filepath.Join(dir, name)
+			if d.IsDir() {
+				wg.Add(1)
+				select {
+				case sem <- struct{}{}:
+					go func(p string) {
+						defer func() { <-sem }()
+						walk(p)
+					}(path)
+				default:
+					walk(path)
+				}
+				continue
+			}
+			if !d.Type().IsRegular() {
+				continue
+			}
+			if !supportedExts[strings.ToLower(filepath.Ext(name))] {
+				continue
+			}
+			info, err := d.Info()
+			if err != nil || info.Size() == 0 {
+				continue
+			}
+			entry := destScanEntry{
+				path:  path,
+				size:  info.Size(),
+				mtime: info.ModTime(),
+			}
+			mu.Lock()
+			destFiles = append(destFiles, entry)
+			mu.Unlock()
+			destCount.Add(1)
+		}
+	}
+
+	wg.Add(1)
+	walk(destDir)
 	wg.Wait()
 	close(walkDone)
 
-	sourceTotal := len(srcFiles)
+	// Build destIndex from collected entries (single goroutine — plain map is safe).
+	destIndex = make(map[string]struct{}, len(destFiles))
+	for _, entry := range destFiles {
+		key := filepath.Base(entry.path) + "|" + strconv.FormatInt(entry.size, 10)
+		destIndex[key] = struct{}{}
+	}
+
 	total := len(destFiles)
 	if total == 0 {
-		return sourceTotal
+		return
 	}
 
 	// Phase 2: populate tsRegistry from dest files, using a disk cache to skip
 	// EXIF extraction for files whose size+mtime have not changed since the
-	// last run.
+	// last run. Workers receive destScanEntry directly — no re-stat required.
 	oldCache := loadPrescanCache(destDir)
 	var newCacheMu sync.Mutex
 	newCache := make(map[string]prescanCacheEntry, len(destFiles))
 
 	var done atomic.Int64
-	exifJobs := make(chan string, 256)
+	exifJobs := make(chan destScanEntry, 256)
 	var exifWg sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
 		exifWg.Add(1)
 		go func() {
 			defer exifWg.Done()
-			for path := range exifJobs {
-				info, err := os.Stat(path)
-				if err != nil {
-					done.Add(1)
-					continue
-				}
-				mtime := info.ModTime()
+			for entry := range exifJobs {
 				var dateT time.Time
 				var dateSrc DateSource
-				if ce, ok := oldCache[path]; ok && ce.Size == info.Size() && ce.Mtime == mtime.Unix() {
+				if ce, ok := oldCache[entry.path]; ok && ce.Size == entry.size && ce.Mtime == entry.mtime.Unix() {
 					// Cache hit: no need to open or parse the file.
 					dateT = time.Unix(ce.Date, 0).UTC()
 					dateSrc = ce.DateSrc
 				} else {
-					dateT, dateSrc = ExtractDate(path, mtime)
+					dateT, dateSrc = ExtractDate(entry.path, entry.mtime)
 				}
 				newCacheMu.Lock()
-				newCache[path] = prescanCacheEntry{
-					Size:    info.Size(),
-					Mtime:   mtime.Unix(),
+				newCache[entry.path] = prescanCacheEntry{
+					Size:    entry.size,
+					Mtime:   entry.mtime.Unix(),
 					Date:    dateT.Unix(),
 					DateSrc: dateSrc,
 				}
 				newCacheMu.Unlock()
-				entry := tsEntry{size: info.Size(), dest: path}
-				for _, k := range buildTsKeys(filepath.Dir(path), dateT, dateSrc, mtime) {
-					if prev, loaded := tsRegistry.LoadOrStore(k, entry); loaded {
-						if entry.size > prev.(tsEntry).size {
-							tsRegistry.Store(k, entry)
+				e := tsEntry{size: entry.size, dest: entry.path}
+				for _, k := range buildTsKeys(filepath.Dir(entry.path), dateT, entry.mtime) {
+					if prev, loaded := tsRegistry.LoadOrStore(k, e); loaded {
+						if e.size > prev.(tsEntry).size {
+							tsRegistry.Store(k, e)
 						}
 					}
 				}
@@ -184,8 +210,8 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 		}
 	}()
 
-	for _, f := range destFiles {
-		exifJobs <- f
+	for _, entry := range destFiles {
+		exifJobs <- entry
 	}
 	close(exifJobs)
 	exifWg.Wait()
@@ -193,6 +219,4 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 
 	fmt.Fprintf(os.Stderr, "\rPre-scan %s  %s / %s  100.0%%  elapsed %s   ",
 		drawBar(total, total, 0), commaf(int64(total)), commaf(int64(total)), time.Since(start).Round(time.Millisecond))
-
-	return sourceTotal
 }

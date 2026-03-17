@@ -8,7 +8,8 @@ import (
 
 // Stats tracks atomic counters across workers.
 type Stats struct {
-	Scanned  atomic.Int64
+	Discovered  atomic.Int64 // files found by Walk() before destIndex filtering
+	Scanned     atomic.Int64
 	Copied   atomic.Int64
 	Skipped  atomic.Int64
 	Renamed  atomic.Int64

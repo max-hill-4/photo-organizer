@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // renamedRE matches files created by pickDest's rename logic: base_N.ext
@@ -49,6 +50,7 @@ func dedupByTimestamp(dir string, dryRun bool) (removed, freed int64, err error)
 	}
 
 	// Collect all files grouped by their parent directory.
+	cache := loadPrescanCache(dir)
 	dirFiles := make(map[string][]fileEntry)
 	var scanned int64
 
@@ -69,8 +71,14 @@ func dedupByTimestamp(dir string, dryRun bool) (removed, freed int64, err error)
 			return nil
 		}
 
-		dateT, dateSrc := ExtractDate(path, info.ModTime())
-		keys := buildTsKeys(filepath.Dir(path), dateT, dateSrc, info.ModTime())
+		mtime := info.ModTime()
+		var dateT time.Time
+		if ce, ok := cache[path]; ok && ce.Size == info.Size() && ce.Mtime == mtime.Unix() {
+			dateT = time.Unix(ce.Date, 0).UTC()
+		} else {
+			dateT, _ = ExtractDate(path, mtime)
+		}
+		keys := buildTsKeys(filepath.Dir(path), dateT, mtime)
 
 		dirPath := filepath.Dir(path)
 		dirFiles[dirPath] = append(dirFiles[dirPath], fileEntry{
