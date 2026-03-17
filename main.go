@@ -119,11 +119,14 @@ func run(ctx context.Context, cfg *Config) error {
 	// Also counts source files so the copy bar has a known total.
 	sourceTotal := prescanDest(cfg.destDir, cfg.sourceDir, cfg.workers)
 
+	stats := &Stats{}
+	var jsonRecords []map[string]any
+
 	// Start walker in background
 	walkDone := make(chan error, 1)
 	go func() {
 		defer close(jobs)
-		walkDone <- Walk(cfg.sourceDir, jobs)
+		walkDone <- Walk(cfg.sourceDir, jobs, stats)
 	}()
 
 	// Start workers
@@ -151,10 +154,6 @@ func run(ctx context.Context, cfg *Config) error {
 		wg.Wait()
 		close(results)
 	}()
-
-	// Aggregate results
-	stats := &Stats{}
-	var jsonRecords []map[string]any
 
 	// Progress ticker
 	go func() {

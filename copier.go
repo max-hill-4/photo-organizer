@@ -33,9 +33,9 @@ var hashRegistry sync.Map
 // Values are tsEntry, tracking the largest file seen so far for that key.
 var tsRegistry sync.Map
 
-// destIndex is populated by prescan: "basename|size" -> true.
-// Allows Process to skip EXIF extraction for files already present in dest.
-var destIndex sync.Map
+// destIndex is populated by prescan: "basename|size" -> struct{}.
+// Written once before any workers start, then read-only — plain map is safe and fast.
+var destIndex map[string]struct{}
 
 type tsEntry struct {
 	size int64
@@ -62,14 +62,8 @@ func initBufPool(size int) {
 }
 
 // Process handles one file: extract date, build dest path, copy/skip/rename.
+// destIndex hits are pre-filtered by the walker and never reach here.
 func Process(cfg *Config, job Job) CopyResult {
-	// Fast path: if this exact filename+size is already in dest, skip without
-	// reading EXIF. Covers the vast majority of files on a re-run.
-	indexKey := filepath.Base(job.Path) + "|" + fmt.Sprintf("%d", job.Info.Size())
-	if _, found := destIndex.Load(indexKey); found {
-		return CopyResult{Src: job.Path, Action: "skipped"}
-	}
-
 	dateT, dateSrc := ExtractDate(job.Path, job.Info.ModTime())
 
 	validDate := !dateT.IsZero() && dateT.Year() >= 1990 && dateT.Year() <= 2100

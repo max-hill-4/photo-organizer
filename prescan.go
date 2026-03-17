@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,10 @@ import (
 // per timestamp wins. It also counts source files and returns that total so
 // the copy progress bar can show a determinate fill.
 func prescanDest(destDir, sourceDir string, workers int) int {
+	// Initialise destIndex as a plain map — written only here (single goroutine),
+	// then read-only for the entire copy phase.
+	destIndex = make(map[string]struct{})
+
 	var destFiles, srcFiles []string
 	var destCount, srcCount atomic.Int64
 	var wg sync.WaitGroup
@@ -29,8 +34,8 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 			}
 			if supportedExts[strings.ToLower(filepath.Ext(path))] {
 				if info, err := os.Stat(path); err == nil {
-					key := filepath.Base(path) + "|" + fmt.Sprintf("%d", info.Size())
-					destIndex.Store(key, struct{}{})
+					key := filepath.Base(path) + "|" + strconv.FormatInt(info.Size(), 10)
+					destIndex[key] = struct{}{}
 				}
 				destFiles = append(destFiles, path)
 				destCount.Add(1)

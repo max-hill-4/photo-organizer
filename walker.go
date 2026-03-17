@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -26,7 +27,9 @@ var supportedExts = map[string]bool{
 // Walk traverses sourceDir concurrently and sends jobs to the jobs channel.
 // Up to 64 directories are scanned in parallel; when all goroutines are busy
 // the work falls back to inline recursion so there is no deadlock.
-func Walk(sourceDir string, jobs chan<- Job) error {
+// Files already present in destIndex are counted as skipped directly without
+// touching the jobs channel or any worker goroutine.
+func Walk(sourceDir string, jobs chan<- Job, stats *Stats) error {
 	var wg sync.WaitGroup
 	// sem limits the number of concurrent directory-scan goroutines.
 	sem := make(chan struct{}, 64)
@@ -76,6 +79,14 @@ func Walk(sourceDir string, jobs chan<- Job) error {
 
 			info, err := d.Info()
 			if err != nil || info.Size() == 0 {
+				continue
+			}
+
+			// Pre-filter: if this file is already in the destination, count it
+			// as skipped here without going through the worker pipeline at all.
+			if _, skip := destIndex[name+"|"+strconv.FormatInt(info.Size(), 10)]; skip {
+				stats.Scanned.Add(1)
+				stats.Skipped.Add(1)
 				continue
 			}
 
