@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/gob"
 	"fmt"
 	"io/fs"
 	"os"
@@ -11,6 +12,42 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// prescanCacheEntry stores the extracted date for one dest file.  The cache
+// is keyed by absolute path; an entry is valid only when Size and Mtime still
+// match the file on disk, so a changed file is automatically re-extracted.
+type prescanCacheEntry struct {
+	Size    int64
+	Mtime   int64 // Unix seconds
+	Date    int64 // Unix seconds
+	DateSrc DateSource
+}
+
+func cacheFilePath(destDir string) string {
+	return filepath.Join(destDir, ".photo-organizer.cache")
+}
+
+func loadPrescanCache(destDir string) map[string]prescanCacheEntry {
+	f, err := os.Open(cacheFilePath(destDir))
+	if err != nil {
+		return make(map[string]prescanCacheEntry)
+	}
+	defer f.Close()
+	var m map[string]prescanCacheEntry
+	if err := gob.NewDecoder(f).Decode(&m); err != nil || m == nil {
+		return make(map[string]prescanCacheEntry)
+	}
+	return m
+}
+
+func savePrescanCache(destDir string, entries map[string]prescanCacheEntry) {
+	f, err := os.Create(cacheFilePath(destDir))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = gob.NewEncoder(f).Encode(entries)
+}
 
 // prescanDest walks destDir and pre-populates tsRegistry with files already
 // present, so the copy run skips source files that are smaller than an
@@ -80,7 +117,13 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 		return sourceTotal
 	}
 
-	// Phase 2: read EXIF from dest files in parallel and populate tsRegistry.
+	// Phase 2: populate tsRegistry from dest files, using a disk cache to skip
+	// EXIF extraction for files whose size+mtime have not changed since the
+	// last run.
+	oldCache := loadPrescanCache(destDir)
+	var newCacheMu sync.Mutex
+	newCache := make(map[string]prescanCacheEntry, len(destFiles))
+
 	var done atomic.Int64
 	exifJobs := make(chan string, 256)
 	var exifWg sync.WaitGroup
@@ -95,9 +138,26 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 					done.Add(1)
 					continue
 				}
-				dateT, dateSrc := ExtractDate(path, info.ModTime())
+				mtime := info.ModTime()
+				var dateT time.Time
+				var dateSrc DateSource
+				if ce, ok := oldCache[path]; ok && ce.Size == info.Size() && ce.Mtime == mtime.Unix() {
+					// Cache hit: no need to open or parse the file.
+					dateT = time.Unix(ce.Date, 0).UTC()
+					dateSrc = ce.DateSrc
+				} else {
+					dateT, dateSrc = ExtractDate(path, mtime)
+				}
+				newCacheMu.Lock()
+				newCache[path] = prescanCacheEntry{
+					Size:    info.Size(),
+					Mtime:   mtime.Unix(),
+					Date:    dateT.Unix(),
+					DateSrc: dateSrc,
+				}
+				newCacheMu.Unlock()
 				entry := tsEntry{size: info.Size(), dest: path}
-				for _, k := range buildTsKeys(filepath.Dir(path), dateT, dateSrc, info.ModTime()) {
+				for _, k := range buildTsKeys(filepath.Dir(path), dateT, dateSrc, mtime) {
 					if prev, loaded := tsRegistry.LoadOrStore(k, entry); loaded {
 						if entry.size > prev.(tsEntry).size {
 							tsRegistry.Store(k, entry)
@@ -129,6 +189,7 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 	}
 	close(exifJobs)
 	exifWg.Wait()
+	savePrescanCache(destDir, newCache)
 
 	fmt.Fprintf(os.Stderr, "\rPre-scan %s  %s / %s  100.0%%  elapsed %s   ",
 		drawBar(total, total, 0), commaf(int64(total)), commaf(int64(total)), time.Since(start).Round(time.Millisecond))

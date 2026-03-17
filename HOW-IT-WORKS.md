@@ -33,6 +33,26 @@ structures:
   handle the case where a duplicate has lost its original metadata but
   preserved the timestamp as mtime.
 
+**Pre-scan cache**
+
+Populating `tsRegistry` requires reading EXIF/metadata from every file in
+the destination — which on a large library means opening every file on every
+run. To eliminate this on re-runs, the tool maintains a cache file at
+`<dest>/.photo-organizer.cache`.
+
+Each entry maps an absolute path to `{size, mtime, extracted date, date
+source}`. On pre-scan, the worker checks the cache first:
+
+- **Cache hit** (size + mtime unchanged) — date is used directly; the file
+  is never opened.
+- **Cache miss** (new or modified file) — `ExtractDate` runs as normal and
+  the result is written to the new cache.
+
+The cache is rewritten after every pre-scan, containing only files currently
+present in the destination — so deleted files are pruned automatically. On a
+stable destination re-run, pre-scan cost drops from N full file reads to N
+`stat` calls plus one gob decode.
+
 **Source walk**
 
 The source directory is counted so the progress bar has a known total to work
@@ -136,6 +156,10 @@ before copying. If the exact same bytes have already been copied anywhere in
 the destination (regardless of filename or folder), the file is skipped. This
 is the most thorough dedup mode but requires reading every file in full.
 
+The computed hash is retained and passed through to the destination collision
+check (`pickDest`), so a file that triggers a name collision is never hashed
+twice.
+
 ---
 
 ## Stage 4 — Results and summary
@@ -198,5 +222,8 @@ Always run with `--dry-run` first to preview what would be deleted:
 - Re-runs where most files are already in the destination are much faster —
   the `destIndex` pre-filter means skipped files cost two atomic counter
   increments, no file I/O at all
+- Pre-scan on a stable destination is equally fast: the cache (`<dest>/.photo-organizer.cache`)
+  reduces EXIF extraction to a `stat` call per file; only new or changed
+  destination files are opened and parsed
 - The HEIC and video date readers are limited to 512 KB per file; EXIF data
   is always within the first few hundred bytes so this is more than sufficient

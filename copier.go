@@ -97,12 +97,15 @@ func Process(cfg *Config, job Job) CopyResult {
 	}
 
 	// Hash-based global dedup: skip if we've already copied this exact file.
+	// Retain the hash so copyFile/pickDest can reuse it without re-reading.
+	var computedHash string
 	if cfg.hashDedup {
 		h, err := hashFile(job.Path)
 		if err == nil {
 			if _, seen := hashRegistry.LoadOrStore(h, job.Path); seen {
 				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
 			}
+			computedHash = h
 		}
 	}
 
@@ -110,7 +113,7 @@ func Process(cfg *Config, job Job) CopyResult {
 		os.Remove(prevDestToDelete)
 	}
 
-	action, finalDest, n, err := copyFile(cfg, job.Path, destPath, job.Info.Size())
+	action, finalDest, n, err := copyFile(cfg, job.Path, destPath, job.Info.Size(), computedHash)
 	if err == nil && (action == "copied" || action == "renamed") {
 		mtime := job.Info.ModTime()
 		_ = os.Chtimes(finalDest, mtime, mtime)
@@ -144,8 +147,9 @@ func buildTsKeys(destDir string, dateT time.Time, dateSrc DateSource, mtime time
 }
 
 // copyFile copies src to dest. Returns action, final dest path, bytes written, error.
-func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int64, error) {
-	finalDest, skip, err := pickDest(dest, src, srcSize, cfg.hashDedup)
+// knownSrcHash may be non-empty when the caller has already computed the MD5.
+func copyFile(cfg *Config, src, dest string, srcSize int64, knownSrcHash string) (string, string, int64, error) {
+	finalDest, skip, err := pickDest(dest, src, srcSize, cfg.hashDedup, knownSrcHash)
 	if err != nil {
 		return "error", dest, 0, err
 	}
@@ -187,9 +191,13 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 //   - dest exists, same size   → (dest, true)  skip
 //   - dest exists, same hash   → (dest, true)  skip
 //   - dest exists, different   → try _1.._99
-func pickDest(dest, srcPath string, srcSize int64, hashDedup bool) (string, bool, error) {
-	// Lazily compute source hash only when a collision actually occurs.
-	var srcHash string
+//
+// knownSrcHash may be non-empty when the caller has already computed the hash
+// (e.g. for --hash-dedup), avoiding a redundant full file read.
+func pickDest(dest, srcPath string, srcSize int64, hashDedup bool, knownSrcHash string) (string, bool, error) {
+	// Use any pre-computed hash the caller already has; fall back to lazy
+	// computation only when a collision actually occurs.
+	srcHash := knownSrcHash
 	getSrcHash := func() string {
 		if srcHash == "" {
 			srcHash, _ = hashFile(srcPath)
