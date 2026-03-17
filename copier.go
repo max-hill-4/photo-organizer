@@ -49,22 +49,31 @@ func Process(cfg *Config, job Job) CopyResult {
 
 	destPath := filepath.Join(destDir, filepath.Base(job.Path))
 
-	// Same-folder dedup: for files with a reliable timestamp (EXIF/HEIC), keep only
-	// the largest. We track the dest path so the smaller file can be removed if a
-	// larger one arrives later.
-	var tsKey string
+	// Same-folder dedup: group files by shared timestamp keys, keep largest.
+	// buildTsKeys indexes under both the primary date and mtime so a degraded
+	// duplicate (one that lost its EXIF but preserved mtime) is still caught.
+	tsKeys := buildTsKeys(destDir, dateT, dateSrc, job.Info.ModTime())
 	var prevDestToDelete string
-	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC || dateSrc == DateSourceVideo {
-		tsKey = destDir + "|" + dateT.Format("2006:01:02 15:04:05")
-		cur := tsEntry{size: job.Info.Size()}
-		if prev, loaded := tsRegistry.LoadOrStore(tsKey, cur); loaded {
-			prevE := prev.(tsEntry)
-			if job.Info.Size() <= prevE.size {
-				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
+	var bestPrev *tsEntry
+	for _, k := range tsKeys {
+		if prev, loaded := tsRegistry.Load(k); loaded {
+			e := prev.(tsEntry)
+			if bestPrev == nil || e.size > bestPrev.size {
+				bestPrev = &e
 			}
-			// Current is larger — remove the previously copied smaller file.
-			prevDestToDelete = prevE.dest
-			tsRegistry.Store(tsKey, cur)
+		}
+	}
+	if bestPrev != nil {
+		if job.Info.Size() <= bestPrev.size {
+			return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
+		}
+		// Current is larger — remove the previously copied smaller file.
+		prevDestToDelete = bestPrev.dest
+	}
+	storeTsKeys := func(dest string) {
+		entry := tsEntry{size: job.Info.Size(), dest: dest}
+		for _, k := range tsKeys {
+			tsRegistry.Store(k, entry)
 		}
 	}
 
@@ -76,9 +85,7 @@ func Process(cfg *Config, job Job) CopyResult {
 		if info, err := os.Stat(destPath); err == nil && info.Size() == job.Info.Size() {
 			action = "skipped"
 		}
-		if tsKey != "" {
-			tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: destPath})
-		}
+		storeTsKeys(destPath)
 		return CopyResult{
 			Src:        job.Path,
 			Dst:        destPath,
@@ -108,14 +115,32 @@ func Process(cfg *Config, job Job) CopyResult {
 		mtime := job.Info.ModTime()
 		_ = os.Chtimes(finalDest, mtime, mtime)
 	}
-	if tsKey != "" && err == nil {
-		tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: finalDest})
+	if err == nil {
+		storeTsKeys(finalDest)
 	}
 	result := CopyResult{Src: job.Path, Dst: finalDest, DateSource: dateSrc, Date: dateT, Action: action, Bytes: n, Err: err}
 	if !validDate && action == "copied" {
 		result.Action = "unknown_date"
 	}
 	return result
+}
+
+// buildTsKeys returns the timestamp keys to register/check in tsRegistry for
+// a file. We always include the primary extracted date. For files with a
+// reliable source (EXIF/HEIC/Video) we also index by mtime when it differs —
+// a degraded duplicate that has lost its original metadata may only have mtime
+// left, and that mtime often matches the original's creation timestamp.
+func buildTsKeys(destDir string, dateT time.Time, dateSrc DateSource, mtime time.Time) []string {
+	dt := dateT.UTC().Truncate(time.Second)
+	primary := destDir + "|" + dt.Format("2006:01:02 15:04:05")
+
+	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC || dateSrc == DateSourceVideo {
+		mt := mtime.UTC().Truncate(time.Second)
+		if !mt.Equal(dt) {
+			return []string{primary, destDir + "|" + mt.Format("2006:01:02 15:04:05")}
+		}
+	}
+	return []string{primary}
 }
 
 // copyFile copies src to dest. Returns action, final dest path, bytes written, error.
