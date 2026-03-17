@@ -4,8 +4,6 @@ Apple Photos and iPhoto libraries from macOS 10.15 and earlier are no longer sup
 
 This tool extracts all your photos and videos out of those libraries and organises them into a simple `YYYY/MM/DD/filename.ext` folder structure you can browse in any file explorer, import into Google Photos, or archive however you like.
 
-It also handles a common problem with old Apple libraries: the same photo often exists in multiple places with different names (e.g. `IMG_0178.jpg` and a UUID-named copy like `8A198053-....jpeg`). The `dedup` tool finds these same-second duplicates and removes the smaller copy, so you don't end up with hundreds of gigabytes of duplicates.
-
 ## Install
 
 Requires [Go 1.22+](https://go.dev/dl/).
@@ -27,11 +25,12 @@ go build -ldflags="-s -w" -o photo-organizer .
 | Flag | Default | Description |
 |---|---|---|
 | `--dry-run` | false | Print what would happen, no files copied |
-| `--workers` | 4 | Parallel copy workers |
+| `--workers` | NumCPU | Parallel copy workers |
 | `--buf-size` | 8192 | I/O buffer size in KB |
 | `--log-file` | — | Write full JSON log to file |
 | `--unknown-dir` | `<dest>/unknown` | Folder for files with no determinable date |
 | `--verbose` | false | Log every file action |
+| `--hash-dedup` | false | Use MD5 hash to detect duplicates across different filenames/sizes |
 | `--date-test` | — | Test date extraction on a single file and exit |
 
 ## Examples
@@ -43,7 +42,7 @@ go build -ldflags="-s -w" -o photo-organizer .
 
 **Full run:**
 ```bash
-./photo-organizer --workers 4 --log-file run.json /mnt/d/Pictures /mnt/c/Users/you/Pictures/Backup
+./photo-organizer --log-file run.json /mnt/d/Pictures /mnt/c/Users/you/Pictures/Backup
 ```
 
 **Check what date a single file would get:**
@@ -52,11 +51,6 @@ go build -ldflags="-s -w" -o photo-organizer .
 # File:   /mnt/d/Pictures/IMG_1234.JPG
 # Date:   2021-06-14
 # Source: EXIF
-```
-
-**Tune workers for faster SSDs:**
-```bash
-./photo-organizer --workers 8 /source /dest
 ```
 
 ## How it works
@@ -75,6 +69,7 @@ Files where no reliable date can be found go into `<dest>/unknown/`.
 
 - Dest file exists, **same size** → skip (already copied)
 - Dest file exists, **different size** → save as `filename_1.ext`, `filename_2.ext`, etc.
+- Two files with the same EXIF timestamp in the same folder → keep the largest (highest quality)
 
 ### Supported formats
 
@@ -104,29 +99,6 @@ Elapsed: 47m 2s   Avg: 22.3 MB/s
 ```
 
 Errors are logged line-by-line to `errors.log` in the working directory.
-
-## Deduplication
-
-Old Apple libraries frequently contain the same photo multiple times — once with its original camera name (`IMG_XXXX.jpg`) and again with a UUID name (`8A198053-441B-4B16-9DA0-3639CCE75AEC.jpeg`). These are created when Photos or iPhoto imports photos and re-encodes them internally.
-
-The `dedup` tool detects these by comparing EXIF `DateTimeOriginal` timestamps. Two files in the same date folder taken at the exact same second are almost certainly the same photo. It keeps the largest version (highest quality) and deletes the smaller one.
-
-**Build:**
-```bash
-go build -ldflags="-s -w" -o dedup ./cmd/dedup/
-```
-
-**Dry run first:**
-```bash
-./dedup --dry-run /mnt/c/Users/yourname/Pictures/Backup
-```
-
-**Delete duplicates:**
-```bash
-./dedup /mnt/c/Users/yourname/Pictures/Backup
-```
-
-The `photo-organizer` tool also applies this same-second dedup logic during copying, so if you run it fresh it won't create duplicates in the first place.
 
 ## Benchmarks
 
