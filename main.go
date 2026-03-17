@@ -38,6 +38,7 @@ func main() {
 		verbose    = flag.Bool("verbose", false, "Log each file action")
 		hashDedup  = flag.Bool("hash-dedup", false, "Use MD5 hash to detect duplicates across different filenames/sizes")
 		dateTest   = flag.String("date-test", "", "Test date extraction on a single file and exit")
+		dedupDest  = flag.String("dedup-dest", "", "Scan a dest dir for _1/_2 duplicates and remove them")
 	)
 	flag.Parse()
 
@@ -50,6 +51,15 @@ func main() {
 		}
 		t, src := ExtractDate(*dateTest, info.ModTime())
 		fmt.Printf("File:   %s\nDate:   %s\nSource: %s\n", *dateTest, t.Format("2006-01-02"), src)
+		return
+	}
+
+	// --dedup-dest mode
+	if *dedupDest != "" {
+		if err := runDedupDest(*dedupDest, *dryRun); err != nil {
+			fmt.Fprintln(os.Stderr, "fatal:", err)
+			os.Exit(1)
+		}
 		return
 	}
 

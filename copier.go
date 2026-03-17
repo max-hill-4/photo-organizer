@@ -166,7 +166,7 @@ func Process(cfg *Config, job Job) CopyResult {
 
 // copyFile copies src to dest handling dedup. Returns action, final dest path, bytes written, error.
 func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int64, error) {
-	finalDest, skip, err := pickDest(dest, srcSize, cfg.hashDedup)
+	finalDest, skip, err := pickDest(dest, src, srcSize, cfg.hashDedup)
 	if err != nil {
 		return "error", dest, 0, err
 	}
@@ -206,9 +206,18 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 // pickDest resolves the final destination path:
 // - dest not exist → (dest, false)
 // - dest exists, same size → (dest, true) skip
-// - dest exists, same hash (if hashDedup) → (dest, true) skip
+// - dest exists, same hash → (dest, true) skip (always checked to prevent _1 duplicates)
 // - dest exists, different content → try _1.._99
-func pickDest(dest string, srcSize int64, hashDedup bool) (string, bool, error) {
+func pickDest(dest, srcPath string, srcSize int64, hashDedup bool) (string, bool, error) {
+	// Lazily compute source hash only if we actually need it.
+	var srcHash string
+	getSrcHash := func() string {
+		if srcHash == "" {
+			srcHash, _ = hashFile(srcPath)
+		}
+		return srcHash
+	}
+
 	check := func(path string) (exists bool, skip bool, err error) {
 		info, err := os.Stat(path)
 		if os.IsNotExist(err) {
@@ -220,13 +229,17 @@ func pickDest(dest string, srcSize int64, hashDedup bool) (string, bool, error) 
 		if info.Size() == srcSize {
 			return true, true, nil // same size → skip
 		}
+		// Sizes differ — always hash-compare so files with the same content but
+		// different embedded metadata (e.g. one copy stripped of EXIF) don't
+		// end up as both file.jpg and file_1.jpg.
+		if h := getSrcHash(); h != "" {
+			if dh, err := hashFile(path); err == nil && dh == h {
+				return true, true, nil
+			}
+		}
 		if hashDedup {
-			// sizes differ but content might still match
-			sh, err := hashFile(path)
-			if err == nil {
-				if _, seen := hashRegistry.Load(sh); seen {
-					return true, true, nil
-				}
+			if _, seen := hashRegistry.Load(getSrcHash()); seen {
+				return true, true, nil
 			}
 		}
 		return true, false, nil // exists but different → need rename
