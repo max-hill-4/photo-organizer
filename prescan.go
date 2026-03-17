@@ -96,7 +96,7 @@ func prescanDest(destDir, sourceDir string, workers int) int {
 					continue
 				}
 				dateT, dateSrc := ExtractDate(path, info.ModTime())
-				if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC {
+				if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC || dateSrc == DateSourceVideo {
 					tsKey := filepath.Dir(path) + "|" + dateT.Format("2006:01:02 15:04:05")
 					entry := tsEntry{size: info.Size(), dest: path}
 					if prev, loaded := tsRegistry.LoadOrStore(tsKey, entry); loaded {

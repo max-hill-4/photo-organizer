@@ -54,7 +54,7 @@ func Process(cfg *Config, job Job) CopyResult {
 	// larger one arrives later.
 	var tsKey string
 	var prevDestToDelete string
-	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC {
+	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC || dateSrc == DateSourceVideo {
 		tsKey = destDir + "|" + dateT.Format("2006:01:02 15:04:05")
 		cur := tsEntry{size: job.Info.Size()}
 		if prev, loaded := tsRegistry.LoadOrStore(tsKey, cur); loaded {
