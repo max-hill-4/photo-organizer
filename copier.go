@@ -6,9 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -21,44 +19,6 @@ type CopyResult struct {
 	Action     string // "copied", "skipped", "renamed", "error", "unknown_date"
 	Bytes      int64
 	Err        error
-}
-
-// dirCache avoids redundant MkdirAll syscalls.
-var dirCache sync.Map
-
-// hashRegistry stores MD5 hashes of all copied source files for global dedup.
-var hashRegistry sync.Map
-
-// tsRegistry stores "destDir|timestamp" keys to detect same-folder duplicates.
-// Values are tsEntry, tracking the largest file seen so far for that key.
-var tsRegistry sync.Map
-
-// destIndex is populated by prescan: "basename|size" -> struct{}.
-// Written once before any workers start, then read-only — plain map is safe and fast.
-var destIndex map[string]struct{}
-
-type tsEntry struct {
-	size int64
-	dest string
-}
-
-var uuidRE = regexp.MustCompile(`(?i)^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\.[a-zA-Z0-9]+$`)
-
-// bufPool holds reusable I/O buffers. Size is set once at startup via initBufPool.
-var bufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 8*1024*1024)
-		return &buf
-	},
-}
-
-func initBufPool(size int) {
-	if size > 0 {
-		bufPool.New = func() any {
-			buf := make([]byte, size)
-			return &buf
-		}
-	}
 }
 
 // Process handles one file: extract date, build dest path, copy/skip/rename.
@@ -78,7 +38,7 @@ func Process(cfg *Config, job Job) CopyResult {
 			fmt.Sprintf("%02d", dateT.Day()))
 	}
 
-	// Ensure destination directory exists (cached)
+	// Ensure destination directory exists (cached).
 	if _, loaded := dirCache.LoadOrStore(destDir, true); !loaded {
 		if !cfg.dryRun {
 			if err := os.MkdirAll(destDir, 0755); err != nil {
@@ -91,8 +51,7 @@ func Process(cfg *Config, job Job) CopyResult {
 
 	// Same-folder dedup: for files with a reliable timestamp (EXIF/HEIC), keep only
 	// the largest. We track the dest path so the smaller file can be removed if a
-	// larger one arrives later, and store job.Info.Size() (not bytes written) so
-	// re-runs correctly recognise already-present files as their real size.
+	// larger one arrives later.
 	var tsKey string
 	var prevDestToDelete string
 	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC {
@@ -114,11 +73,9 @@ func Process(cfg *Config, job Job) CopyResult {
 		if !validDate {
 			action = "unknown_date"
 		}
-		// Check if dest already exists with same size — same logic as the real copy.
 		if info, err := os.Stat(destPath); err == nil && info.Size() == job.Info.Size() {
 			action = "skipped"
 		}
-		// Update tsRegistry so subsequent files with the same timestamp benefit.
 		if tsKey != "" {
 			tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: destPath})
 		}
@@ -132,12 +89,12 @@ func Process(cfg *Config, job Job) CopyResult {
 		}
 	}
 
-	// Hash-based global dedup: skip if we've already copied this exact file
+	// Hash-based global dedup: skip if we've already copied this exact file.
 	if cfg.hashDedup {
 		h, err := hashFile(job.Path)
 		if err == nil {
 			if _, seen := hashRegistry.LoadOrStore(h, job.Path); seen {
-				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped", Bytes: 0}
+				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
 			}
 		}
 	}
@@ -147,13 +104,10 @@ func Process(cfg *Config, job Job) CopyResult {
 	}
 
 	action, finalDest, n, err := copyFile(cfg, job.Path, destPath, job.Info.Size())
-	// Preserve original timestamps on newly copied files
 	if err == nil && (action == "copied" || action == "renamed") {
 		mtime := job.Info.ModTime()
 		_ = os.Chtimes(finalDest, mtime, mtime)
 	}
-	// Update registry with actual dest path and source size (not bytes written,
-	// so skipped files still register at their real size for future comparisons).
 	if tsKey != "" && err == nil {
 		tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: finalDest})
 	}
@@ -164,7 +118,7 @@ func Process(cfg *Config, job Job) CopyResult {
 	return result
 }
 
-// copyFile copies src to dest handling dedup. Returns action, final dest path, bytes written, error.
+// copyFile copies src to dest. Returns action, final dest path, bytes written, error.
 func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int64, error) {
 	finalDest, skip, err := pickDest(dest, src, srcSize, cfg.hashDedup)
 	if err != nil {
@@ -204,12 +158,12 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 }
 
 // pickDest resolves the final destination path:
-// - dest not exist → (dest, false)
-// - dest exists, same size → (dest, true) skip
-// - dest exists, same hash → (dest, true) skip (always checked to prevent _1 duplicates)
-// - dest exists, different content → try _1.._99
+//   - dest not exist           → (dest, false)
+//   - dest exists, same size   → (dest, true)  skip
+//   - dest exists, same hash   → (dest, true)  skip
+//   - dest exists, different   → try _1.._99
 func pickDest(dest, srcPath string, srcSize int64, hashDedup bool) (string, bool, error) {
-	// Lazily compute source hash only if we actually need it.
+	// Lazily compute source hash only when a collision actually occurs.
 	var srcHash string
 	getSrcHash := func() string {
 		if srcHash == "" {
@@ -227,11 +181,10 @@ func pickDest(dest, srcPath string, srcSize int64, hashDedup bool) (string, bool
 			return false, false, err
 		}
 		if info.Size() == srcSize {
-			return true, true, nil // same size → skip
+			return true, true, nil
 		}
-		// Sizes differ — always hash-compare so files with the same content but
-		// different embedded metadata (e.g. one copy stripped of EXIF) don't
-		// end up as both file.jpg and file_1.jpg.
+		// Sizes differ — always hash-compare so files with identical content but
+		// different embedded metadata don't become both file.jpg and file_1.jpg.
 		if h := getSrcHash(); h != "" {
 			if dh, err := hashFile(path); err == nil && dh == h {
 				return true, true, nil
@@ -242,7 +195,7 @@ func pickDest(dest, srcPath string, srcSize int64, hashDedup bool) (string, bool
 				return true, true, nil
 			}
 		}
-		return true, false, nil // exists but different → need rename
+		return true, false, nil
 	}
 
 	exists, skip, err := check(dest)
