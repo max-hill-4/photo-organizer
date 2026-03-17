@@ -108,8 +108,8 @@ func heicDate(path string) (time.Time, bool) {
 	}
 	defer f.Close()
 
-	// Read up to 5 MB (EXIF is near the start)
-	data, err := io.ReadAll(io.LimitReader(f, 5*1024*1024))
+	// Read up to 512 KB — EXIF is always in the first few hundred bytes
+	data, err := io.ReadAll(io.LimitReader(f, 512*1024))
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -144,7 +144,8 @@ func videoDate(path string) (time.Time, bool) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, 10*1024*1024))
+	// mvhd atom is always within the first few KB of a well-formed file
+	data, err := io.ReadAll(io.LimitReader(f, 512*1024))
 	if err != nil {
 		return time.Time{}, false
 	}

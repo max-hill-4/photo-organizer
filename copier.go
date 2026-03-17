@@ -29,12 +29,22 @@ var dirCache sync.Map
 // hashRegistry stores MD5 hashes of all copied source files for global dedup.
 var hashRegistry sync.Map
 
-// tsRegistry stores "destDir|timestamp" keys to detect same-second duplicates.
+// tsRegistry stores "destDir|timestamp" keys to detect same-folder duplicates.
+// Values are tsEntry, tracking the largest file seen so far for that key.
 var tsRegistry sync.Map
+
+// destIndex is populated by prescan: "basename|size" -> true.
+// Allows Process to skip EXIF extraction for files already present in dest.
+var destIndex sync.Map
+
+type tsEntry struct {
+	size int64
+	dest string
+}
 
 var uuidRE = regexp.MustCompile(`(?i)^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\.[a-zA-Z0-9]+$`)
 
-// bufPool holds reusable I/O buffers.
+// bufPool holds reusable I/O buffers. Size is set once at startup via initBufPool.
 var bufPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 8*1024*1024)
@@ -42,8 +52,24 @@ var bufPool = sync.Pool{
 	},
 }
 
+func initBufPool(size int) {
+	if size > 0 {
+		bufPool.New = func() any {
+			buf := make([]byte, size)
+			return &buf
+		}
+	}
+}
+
 // Process handles one file: extract date, build dest path, copy/skip/rename.
 func Process(cfg *Config, job Job) CopyResult {
+	// Fast path: if this exact filename+size is already in dest, skip without
+	// reading EXIF. Covers the vast majority of files on a re-run.
+	indexKey := filepath.Base(job.Path) + "|" + fmt.Sprintf("%d", job.Info.Size())
+	if _, found := destIndex.Load(indexKey); found {
+		return CopyResult{Src: job.Path, Action: "skipped"}
+	}
+
 	dateT, dateSrc := ExtractDate(job.Path, job.Info.ModTime())
 
 	validDate := !dateT.IsZero() && dateT.Year() >= 1990 && dateT.Year() <= 2100
@@ -69,17 +95,22 @@ func Process(cfg *Config, job Job) CopyResult {
 
 	destPath := filepath.Join(destDir, filepath.Base(job.Path))
 
-	// Same-second dedup: if another file with the same EXIF timestamp has already
-	// claimed this dest folder, skip the current file if it is smaller.
-	if dateSrc == DateSourceEXIF {
-		tsKey := destDir + "|" + dateT.Format("2006:01:02 15:04:05")
-		type entry struct{ size int64 }
-		cur := entry{job.Info.Size()}
+	// Same-folder dedup: for files with a reliable timestamp (EXIF/HEIC), keep only
+	// the largest. We track the dest path so the smaller file can be removed if a
+	// larger one arrives later, and store job.Info.Size() (not bytes written) so
+	// re-runs correctly recognise already-present files as their real size.
+	var tsKey string
+	var prevDestToDelete string
+	if dateSrc == DateSourceEXIF || dateSrc == DateSourceHEIC {
+		tsKey = destDir + "|" + dateT.Format("2006:01:02 15:04:05")
+		cur := tsEntry{size: job.Info.Size()}
 		if prev, loaded := tsRegistry.LoadOrStore(tsKey, cur); loaded {
-			if cur.size <= prev.(entry).size {
+			prevE := prev.(tsEntry)
+			if job.Info.Size() <= prevE.size {
 				return CopyResult{Src: job.Path, Dst: destPath, DateSource: dateSrc, Date: dateT, Action: "skipped"}
 			}
-			// Current is larger — update registry and proceed to copy
+			// Current is larger — remove the previously copied smaller file.
+			prevDestToDelete = prevE.dest
 			tsRegistry.Store(tsKey, cur)
 		}
 	}
@@ -88,6 +119,14 @@ func Process(cfg *Config, job Job) CopyResult {
 		action := "copied"
 		if !validDate {
 			action = "unknown_date"
+		}
+		// Check if dest already exists with same size — same logic as the real copy.
+		if info, err := os.Stat(destPath); err == nil && info.Size() == job.Info.Size() {
+			action = "skipped"
+		}
+		// Update tsRegistry so subsequent files with the same timestamp benefit.
+		if tsKey != "" {
+			tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: destPath})
 		}
 		return CopyResult{
 			Src:        job.Path,
@@ -109,11 +148,20 @@ func Process(cfg *Config, job Job) CopyResult {
 		}
 	}
 
+	if prevDestToDelete != "" {
+		os.Remove(prevDestToDelete)
+	}
+
 	action, finalDest, n, err := copyFile(cfg, job.Path, destPath, job.Info.Size())
 	// Preserve original timestamps on newly copied files
 	if err == nil && (action == "copied" || action == "renamed") {
 		mtime := job.Info.ModTime()
 		_ = os.Chtimes(finalDest, mtime, mtime)
+	}
+	// Update registry with actual dest path and source size (not bytes written,
+	// so skipped files still register at their real size for future comparisons).
+	if tsKey != "" && err == nil {
+		tsRegistry.Store(tsKey, tsEntry{size: job.Info.Size(), dest: finalDest})
 	}
 	result := CopyResult{Src: job.Path, Dst: finalDest, DateSource: dateSrc, Date: dateT, Action: action, Bytes: n, Err: err}
 	if !validDate && action == "copied" {
@@ -152,12 +200,8 @@ func copyFile(cfg *Config, src, dest string, srcSize int64) (string, string, int
 
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
-	buf := *bufPtr
-	if cfg.bufSize > 0 && cfg.bufSize != len(buf) {
-		buf = make([]byte, cfg.bufSize)
-	}
 
-	n, err := io.CopyBuffer(f, in, buf)
+	n, err := io.CopyBuffer(f, in, *bufPtr)
 	if err != nil {
 		os.Remove(finalDest)
 		return "error", dest, 0, err

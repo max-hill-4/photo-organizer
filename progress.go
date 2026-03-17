@@ -102,6 +102,42 @@ func (s *Stats) PrintSummary(elapsed time.Duration) {
 	fmt.Printf("Elapsed: %s   Avg: %.1f MB/s\n", fmtDuration(elapsed), avgMBs)
 }
 
+// spinnerFrames cycles for indeterminate progress (unknown total).
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// drawBar renders a 20-char filled bar when total > 0, or a spinner frame when total == 0.
+func drawBar(done, total, tick int) string {
+	if total <= 0 {
+		return fmt.Sprintf("[%s]", spinnerFrames[tick%len(spinnerFrames)])
+	}
+	pct := float64(done) / float64(total)
+	filled := int(pct * 20)
+	if filled > 20 {
+		filled = 20
+	}
+	return fmt.Sprintf("[%s%s]", repeatRune('█', filled), repeatRune('░', 20-filled))
+}
+
+// etaStr returns an ETA string when calculable, otherwise "".
+func etaStr(done, total int, elapsed time.Duration) string {
+	if done <= 0 || total <= 0 || done >= total {
+		return ""
+	}
+	remaining := time.Duration(float64(elapsed) / float64(done) * float64(total-done))
+	return fmt.Sprintf("  ETA %s", remaining.Round(time.Second))
+}
+
+func repeatRune(c rune, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	s := make([]rune, n)
+	for i := range s {
+		s[i] = c
+	}
+	return string(s)
+}
+
 func commaf(n int64) string {
 	s := fmt.Sprintf("%d", n)
 	out := make([]byte, 0, len(s)+len(s)/3)

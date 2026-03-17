@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/schollz/progressbar/v3"
 )
 
 // Config holds all runtime settings.
@@ -32,7 +31,7 @@ type Config struct {
 func main() {
 	var (
 		dryRun     = flag.Bool("dry-run", false, "Print actions, no copying")
-		workers    = flag.Int("workers", 4, "Parallel workers")
+		workers    = flag.Int("workers", runtime.NumCPU(), "Parallel workers")
 		bufSizeKB  = flag.Int("buf-size", 8192, "I/O buffer in KB")
 		logFile    = flag.String("log-file", "", "Write JSON summary to file")
 		unknownDir = flag.String("unknown-dir", "", "Dir for undatable files (default: <dest>/unknown)")
@@ -81,6 +80,7 @@ func main() {
 	if cfg.workers > runtime.NumCPU()*4 {
 		cfg.workers = runtime.NumCPU() * 4
 	}
+	initBufPool(cfg.bufSize)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -115,6 +115,10 @@ func run(ctx context.Context, cfg *Config) error {
 	errWriter := bufio.NewWriter(errLog)
 	defer errWriter.Flush()
 
+	// Pre-populate tsRegistry from dest so smaller duplicates are skipped.
+	// Also counts source files so the copy bar has a known total.
+	sourceTotal := prescanDest(cfg.destDir, cfg.sourceDir, cfg.workers)
+
 	// Start walker in background
 	walkDone := make(chan error, 1)
 	go func() {
@@ -148,22 +152,34 @@ func run(ctx context.Context, cfg *Config) error {
 		close(results)
 	}()
 
-	// Progress bar (indeterminate)
-	bar := progressbar.NewOptions(-1,
-		progressbar.OptionSetDescription("Processing"),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionThrottle(200*time.Millisecond),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionSetRenderBlankState(true),
-	)
-
 	// Aggregate results
 	stats := &Stats{}
 	var jsonRecords []map[string]any
 
+	// Progress ticker
+	go func() {
+		for tick := 0; ; tick++ {
+			time.Sleep(500 * time.Millisecond)
+			scanned := int(stats.Scanned.Load())
+			skipped := int(stats.Skipped.Load())
+			elapsed := time.Since(start)
+			skipPct := 0.0
+			if scanned > 0 {
+				skipPct = float64(skipped) / float64(scanned) * 100
+			}
+			fmt.Fprintf(os.Stderr, "\rCopying  %s  %s / %s  %.1f%%  skipped %.0f%%  elapsed %s%s   ",
+				drawBar(scanned, sourceTotal, tick),
+				commaf(int64(scanned)), commaf(int64(sourceTotal)),
+				float64(scanned)/float64(sourceTotal)*100,
+				skipPct,
+				elapsed.Round(time.Second),
+				etaStr(scanned, sourceTotal, elapsed),
+			)
+		}
+	}()
+
 	for r := range results {
 		stats.Record(r)
-		bar.Add(1) //nolint
 
 		if r.Err != nil {
 			fmt.Fprintf(errWriter, "%s\t%v\n", r.Src, r.Err)
@@ -186,7 +202,7 @@ func run(ctx context.Context, cfg *Config) error {
 			jsonRecords = append(jsonRecords, rec)
 		}
 	}
-	bar.Finish() //nolint
+	fmt.Fprintln(os.Stderr)
 
 	// Check walk error
 	if walkErr := <-walkDone; walkErr != nil {
